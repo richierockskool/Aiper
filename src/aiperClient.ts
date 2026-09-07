@@ -58,6 +58,7 @@ export class AiperClient {
 
   private cycleTimeout?: ReturnType<typeof setTimeout>;
   private cycleStartedAt = 0;
+  private lastCycleCompletedAt = 0;
   private lastRecognisedStateAt = 0;
   private readonly cycleTimeoutMilliseconds =
     (160 * 60 * 1000);
@@ -719,12 +720,35 @@ export class AiperClient {
       }
 
       return;
-    } /*
+    } 
+    /*
+ * After a confirmed completion the robot may briefly drop offline again
+ * while being removed from the pool, while still retaining its previous
+ * cleaning mode.
+ *
+ * Do not mistake that post-cycle disconnect for a brand-new cleaning run.
+ */
+    const recentlyCompletedCycle =
+  this.lastCycleCompletedAt > 0 &&
+  Date.now() - this.lastCycleCompletedAt <
+    10 * 60 * 1000;
+
+    if (
+      !this.hasObservedCleaningCycle &&
+  hasCleaningMode &&
+  !connected &&
+  recentlyCompletedCycle
+    ) {
+      return;
+    }
+    
+    /*
    * Do NOT start cycle tracking merely because HomeKit sent a command.
    *
    * Start only when the Aiper itself has reported a valid cleaning
    * mode and then disappears from Wi-Fi.
    */
+
     if (
       !this.hasObservedCleaningCycle &&
     hasCleaningMode &&
@@ -776,6 +800,7 @@ export class AiperClient {
   !this.completionSentForCurrentCycle
     ) {
       this.completionSentForCurrentCycle = true;
+      this.lastCycleCompletedAt = Date.now();
       this.clearCycleTimeout();
 
       this.log.info(
@@ -1365,6 +1390,7 @@ export class AiperClient {
     );
 
     this.latestCharging = false;
+    this.lastCycleCompletedAt = 0;
 
     await this.sendMachineAt(`AT+MODE=${modeId}`);
 
