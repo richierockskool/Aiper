@@ -36,6 +36,7 @@ export class AiperClient {
   private awsSessionToken?: string;
   private mqttConnection?: mqtt.MqttClientConnection;
   private mqttConnected = false;
+  private resolvedDeviceId?: string;
   private mqttReconnectPromise?: Promise<void>;
   private mqttSubscriptionsReady = false;
   private lastMqttActivityAt = 0;
@@ -165,6 +166,50 @@ export class AiperClient {
       this.log.info(
         `Aiper device: name=${device.name ?? 'Unknown'} sn=${device.sn ?? 'Unknown'} model=${device.model ?? 'Unknown'}`,
       );
+    }
+    const configuredDeviceId =
+  this.config.deviceId?.trim();
+
+    type AiperDevice = {
+  name?: unknown;
+  sn?: unknown;
+  model?: unknown;
+};
+
+    const typedDevices =
+  devices as AiperDevice[];
+
+    const matchingDevice =
+  typedDevices.find((device) =>
+    typeof device.sn === 'string' &&
+    device.sn === configuredDeviceId,
+  ) ??
+  typedDevices.find((device) =>
+    typeof device.name === 'string' &&
+    typeof configuredDeviceId === 'string' &&
+    device.name.trim().toLowerCase() ===
+      configuredDeviceId.toLowerCase(),
+  ) ??
+  (typedDevices.length === 1
+    ? typedDevices[0]
+    : undefined);
+
+    const discoveredSerial =
+  typeof matchingDevice?.sn === 'string'
+    ? matchingDevice.sn.trim()
+    : '';
+
+    if (discoveredSerial) {
+      this.resolvedDeviceId = discoveredSerial;
+
+      if (
+        configuredDeviceId &&
+    configuredDeviceId !== discoveredSerial
+      ) {
+        this.log.info(
+          `Aiper device ID resolved: ${configuredDeviceId} -> ${discoveredSerial}`,
+        );
+      }
     }
   }
 
@@ -405,6 +450,13 @@ export class AiperClient {
       return 4; 
     }
   }
+  private getRobotSerialNumber(): string | undefined {
+    return (
+      this.resolvedDeviceId ??
+    this.config.deviceId?.trim()
+    );
+  }
+
 
   async subscribeToRobot(): Promise<void> {
     if (!this.mqttConnection) {
@@ -412,7 +464,7 @@ export class AiperClient {
       return;
     }
 
-    const sn = this.config.deviceId;
+    const sn = this.getRobotSerialNumber();
 
     if (!sn) {
       throw new Error('Aiper deviceId not configured.');
@@ -1340,7 +1392,7 @@ export class AiperClient {
       await this.restoreMqttSubscriptions();
     }
 
-    const sn = this.config.deviceId;
+    const sn = this.getRobotSerialNumber();
 
     if (!sn) {
       throw new Error('Aiper deviceId not configured.');
