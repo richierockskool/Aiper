@@ -41,6 +41,8 @@ export class AiperClient {
   private mqttSubscriptionsReady = false;
   private lastMqttActivityAt = 0;
   private mqttSessionRefreshPromise?: Promise<void>;
+  private commandSequence = 0;
+  private readonly mqttDisconnectGraceMilliseconds = 1500;
   private lastCommandKey?: string;
   private lastCommandAt = 0;
   public latestBattery = 100;
@@ -590,20 +592,37 @@ export class AiperClient {
     this.mqttConnected = false;
     this.mqttSubscriptionsReady = false;
 
-    if (this.mqttConnection) {
-      try {
-        await this.mqttConnection.disconnect();
-      } catch {
-      // Ignore a stale/dead connection during forced refresh.
-      }
-    }
-
-    this.mqttConnection = undefined;
+    const staleConnection = this.mqttConnection;
 
     /*
-   * Refresh the complete authentication chain.
-   * This is the important difference from the previous reconnect patch.
+   * Detach the stale connection immediately.
+   *
+   * A dead AWS WebSocket can take a very long time to complete a graceful
+   * disconnect. Give it a short opportunity to close cleanly, then continue
+   * rebuilding the authenticated MQTT session.
    */
+    this.mqttConnection = undefined;
+
+    if (staleConnection) {
+      const disconnectAttempt = staleConnection
+        .disconnect()
+        .catch(() => undefined);
+
+      await Promise.race([
+        disconnectAttempt,
+        new Promise<void>((resolve) => {
+          setTimeout(
+            resolve,
+            this.mqttDisconnectGraceMilliseconds,
+          );
+        }),
+      ]);
+
+      this.log.info(
+        'Aiper stale MQTT connection released. Re-authenticating...',
+      );
+    }
+
     await this.login();
     await this.getOpenIdToken();
     await this.getAwsCredentials();
@@ -1357,20 +1376,16 @@ export class AiperClient {
     return true;
   }
 
-  private async sendMachineAt(atCommand: string): Promise<void> {
+  private async sendMachineAt(
+    atCommand: string,
+  ): Promise<boolean> {
+    const myCommandSequence = ++this.commandSequence;
+
     const mqttHasBeenQuiet =
     this.lastMqttActivityAt === 0 ||
     Date.now() - this.lastMqttActivityAt >
       10 * 60 * 1000;
 
-    /*
-   * The Aiper/AWS WebSocket can remain apparently connected after
-   * the robot has slept for a long period, while commands no longer
-   * reach the device.
-   *
-   * Refresh the complete authenticated MQTT session before the first
-   * command after prolonged inactivity.
-   */
     if (mqttHasBeenQuiet) {
       await this.refreshMqttSession();
     } else if (!this.mqttConnection || !this.mqttConnected) {
@@ -1382,6 +1397,18 @@ export class AiperClient {
       await this.restoreMqttSubscriptions();
     }
 
+    /*
+   * Another HomeKit command arrived while this command was waiting for
+   * MQTT recovery. Only send the newest requested command.
+   */
+    if (myCommandSequence !== this.commandSequence) {
+      this.log.info(
+        `Aiper command superseded during reconnect: ${atCommand}`,
+      );
+
+      return false;
+    }
+
     if (!this.mqttConnection || !this.mqttConnected) {
       throw new Error(
         'Aiper MQTT connection unavailable after reconnect attempt.',
@@ -1390,6 +1417,17 @@ export class AiperClient {
 
     if (!this.mqttSubscriptionsReady) {
       await this.restoreMqttSubscriptions();
+    }
+
+    /*
+   * Check again because restoring subscriptions is asynchronous.
+   */
+    if (myCommandSequence !== this.commandSequence) {
+      this.log.info(
+        `Aiper command superseded before publish: ${atCommand}`,
+      );
+
+      return false;
     }
 
     const sn = this.getRobotSerialNumber();
@@ -1423,6 +1461,8 @@ export class AiperClient {
       message,
       mqtt.QoS.AtLeastOnce,
     );
+
+    return true;
   }
   async startMode(mode: AiperMode): Promise<void> {
     const modeId = this.modeNumber(mode);
@@ -1444,19 +1484,16 @@ export class AiperClient {
     this.latestCharging = false;
     this.lastCycleCompletedAt = 0;
 
-    await this.sendMachineAt(`AT+MODE=${modeId}`);
+    const commandSent =
+  await this.sendMachineAt(`AT+MODE=${modeId}`);
 
-    /*
- * Arm the cleaning-cycle safety timer from the successful
- * cleaning command itself.
- *
- * Do not depend on the robot later reporting online=false,
- * because the N1 Max can disappear from MQTT during a run.
- */
+    if (!commandSent) {
+      return;
+    }
+
     this.beginCleaningCycle(
       `HomeKit started ${mode} cleaning mode`,
     );
-
     
   }
 
@@ -1473,7 +1510,12 @@ export class AiperClient {
     this.lastCommandAt = now;
 
     this.log.info('Aiper real command: stop -> AT+MODE=0');
-    await this.sendMachineAt('AT+MODE=0');
+    const commandSent =
+  await this.sendMachineAt('AT+MODE=0');
+
+    if (!commandSent) {
+      return;
+    }
 
     this.resetCleaningCycle('manual stop command');
   }
